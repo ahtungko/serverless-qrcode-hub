@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
+    "test": "node test/worker.test.cjs",
     "dev": "echo 'Cron triggered at http://localhost:8787/__scheduled?cron=*+*+*+*+*' && wrangler dev --ip 0.0.0.0 --env dev --test-scheduled",
     "deploy": "wrangler deploy"
   },

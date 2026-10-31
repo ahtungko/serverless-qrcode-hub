@@ -1,6 +1,8 @@
 let DB;
+let dbInitPromise = null;
 
 const RESERVED_PATHS = new Set([
+  'api',
   'login',
   'admin',
   '__total_count',
@@ -21,8 +23,14 @@ const EXPIRING_DAYS = 3;
 const EXPIRED_RETENTION_DAYS = 30;
 const DEFAULT_PAGE_SIZE = 10;
 const MAX_PAGE_SIZE = 100;
+const MAX_QR_DATA_LENGTH = 500 * 1024;
 const DEFAULT_WECHAT_ANNOUNCEMENT_HTML = '<p>请长按识别下方二维码</p>';
 const DEFAULT_WECHAT_HINT_HTML = '<p>二维码失效请联系作者更新</p>';
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'SAMEORIGIN',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+};
 const RICH_TEXT_TAG_MAP = {
   a: 'a',
   b: 'strong',
@@ -71,6 +79,7 @@ function json(data, status = 200, headers = {}) {
     headers: {
       'Content-Type': 'application/json;charset=UTF-8',
       'Cache-Control': 'no-store',
+      ...SECURITY_HEADERS,
       ...headers,
     },
   });
@@ -84,7 +93,11 @@ function errorResponse(error) {
 }
 
 function getSessionSecret(env) {
-  return env.SESSION_SECRET || env.PASSWORD || 'serverless-qrcode-hub';
+  const secret = env.SESSION_SECRET || env.PASSWORD;
+  if (!secret || typeof secret !== 'string' || !secret.trim()) {
+    throw new AppError('系统未配置管理员密码 (PASSWORD)，请先在 Cloudflare 环境变量中设置', 500, 'CONFIG_ERROR');
+  }
+  return secret.trim();
 }
 
 function toBase64Url(buffer) {
@@ -109,7 +122,10 @@ async function hmac(value, secret) {
 }
 
 async function createSessionToken(env) {
-  return hmac('admin-session', getSessionSecret(env));
+  const secret = getSessionSecret(env);
+  const expiresAt = Date.now() + SESSION_MAX_AGE * 1000;
+  const signature = await hmac(`admin-session:${expiresAt}`, secret);
+  return `${expiresAt}.${signature}`;
 }
 
 function getCookieValue(cookieHeader, name) {
@@ -128,23 +144,33 @@ function getCookieValue(cookieHeader, name) {
 
 async function verifyAuthCookie(request, env) {
   const currentToken = getCookieValue(request.headers.get('Cookie') || '', SESSION_COOKIE);
-  if (!currentToken) {
+  if (!currentToken || !currentToken.includes('.')) {
     return false;
   }
-  const expectedToken = await createSessionToken(env);
-  return currentToken === expectedToken;
+  const [expiresAtStr, signature] = currentToken.split('.');
+  const expiresAt = Number(expiresAtStr);
+  if (isNaN(expiresAt) || Date.now() > expiresAt) {
+    return false;
+  }
+  try {
+    const secret = getSessionSecret(env);
+    const expectedSig = await hmac(`admin-session:${expiresAtStr}`, secret);
+    return signature === expectedSig;
+  } catch {
+    return false;
+  }
 }
 
 async function setAuthCookie(env) {
   const token = await createSessionToken(env);
   return {
-    'Set-Cookie': `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_MAX_AGE}`,
+    'Set-Cookie': `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_MAX_AGE}`,
   };
 }
 
 function clearAuthCookie() {
   return {
-    'Set-Cookie': `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`,
+    'Set-Cookie': `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`,
   };
 }
 
@@ -320,6 +346,10 @@ function normalizeMappingPayload(payload, options = {}) {
     throw new AppError('微信二维码必须提供原始二维码数据');
   }
 
+  if (qrCodeData && qrCodeData.length > MAX_QR_DATA_LENGTH) {
+    throw new AppError('二维码图片数据过大（不能超过 500KB），请上传较小尺寸的图片');
+  }
+
   const normalized = {
     path,
     target,
@@ -392,7 +422,7 @@ function serializeMapping(row) {
 }
 
 function parseListParams(searchParams) {
-  const page = Math.max(Number(searchParams.get('page') || DEFAULT_PAGE_SIZE / DEFAULT_PAGE_SIZE) || 1, 1);
+  const page = Math.max(Number(searchParams.get('page') || 1) || 1, 1);
   const pageSize = Math.min(
     Math.max(Number(searchParams.get('pageSize') || DEFAULT_PAGE_SIZE) || DEFAULT_PAGE_SIZE, 1),
     MAX_PAGE_SIZE
@@ -434,7 +464,7 @@ function buildFilterQuery(filters) {
     where.push('(enabled = 1 AND expiry IS NOT NULL AND substr(expiry, 1, 10) >= ? AND substr(expiry, 1, 10) <= ?)');
     bindings.push(today, expiringLimit);
   } else if (filters.status === 'expired') {
-    where.push('(expiry IS NOT NULL AND substr(expiry, 1, 10) < ?)');
+    where.push('(enabled = 1 AND expiry IS NOT NULL AND substr(expiry, 1, 10) < ?)');
     bindings.push(today);
   } else if (filters.status === 'disabled') {
     where.push('(enabled = 0)');
@@ -443,8 +473,21 @@ function buildFilterQuery(filters) {
   return { where: where.join(' AND '), bindings };
 }
 
-async function initDatabase() {
-  await DB.prepare(`
+async function ensureDatabase(database = DB) {
+  if (!database) {
+    throw new AppError('D1 数据库未绑定 (DB)', 500, 'DATABASE_NOT_CONFIGURED');
+  }
+  if (!dbInitPromise) {
+    dbInitPromise = initDatabase(database).catch((err) => {
+      dbInitPromise = null;
+      throw err;
+    });
+  }
+  return dbInitPromise;
+}
+
+async function initDatabase(database = DB) {
+  await database.prepare(`
     CREATE TABLE IF NOT EXISTS mappings (
       path TEXT PRIMARY KEY,
       target TEXT NOT NULL,
@@ -462,43 +505,40 @@ async function initDatabase() {
     )
   `).run();
 
-  const tableInfo = await DB.prepare('PRAGMA table_info(mappings)').all();
+  const tableInfo = await database.prepare('PRAGMA table_info(mappings)').all();
   const columns = new Set((tableInfo.results || []).map((column) => column.name));
 
-  if (!columns.has('isWechat')) {
-    await DB.prepare('ALTER TABLE mappings ADD COLUMN isWechat INTEGER DEFAULT 0').run();
-  }
-  if (!columns.has('qrCodeData')) {
-    await DB.prepare('ALTER TABLE mappings ADD COLUMN qrCodeData TEXT').run();
-  }
-  if (!columns.has('announcementHtml')) {
-    await DB.prepare('ALTER TABLE mappings ADD COLUMN announcementHtml TEXT').run();
-  }
-  if (!columns.has('hintHtml')) {
-    await DB.prepare('ALTER TABLE mappings ADD COLUMN hintHtml TEXT').run();
-  }
-  if (!columns.has('visit_count')) {
-    await DB.prepare('ALTER TABLE mappings ADD COLUMN visit_count INTEGER DEFAULT 0').run();
-  }
-  if (!columns.has('last_visited_at')) {
-    await DB.prepare('ALTER TABLE mappings ADD COLUMN last_visited_at TEXT').run();
-  }
-  if (!columns.has('updated_at')) {
-    await DB.prepare('ALTER TABLE mappings ADD COLUMN updated_at TEXT').run();
+  // Another isolate may add the column after our schema inspection.
+  async function addColumn(name, definition) {
+    if (columns.has(name)) return;
+    try {
+      await database.prepare(`ALTER TABLE mappings ADD COLUMN ${name} ${definition}`).run();
+    } catch (error) {
+      const current = await database.prepare('PRAGMA table_info(mappings)').all();
+      if (!(current.results || []).some((column) => column.name === name)) throw error;
+    }
   }
 
-  await DB.prepare(`
+  await addColumn('isWechat', 'INTEGER DEFAULT 0');
+  await addColumn('qrCodeData', 'TEXT');
+  await addColumn('announcementHtml', 'TEXT');
+  await addColumn('hintHtml', 'TEXT');
+  await addColumn('visit_count', 'INTEGER DEFAULT 0');
+  await addColumn('last_visited_at', 'TEXT');
+  await addColumn('updated_at', 'TEXT');
+
+  await database.prepare(`
     UPDATE mappings
     SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
     WHERE updated_at IS NULL OR updated_at = ''
   `).run();
 
-  await DB.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_expiry ON mappings(expiry)').run();
-  await DB.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_created_at ON mappings(created_at)').run();
-  await DB.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_updated_at ON mappings(updated_at)').run();
-  await DB.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_enabled_expiry ON mappings(enabled, expiry)').run();
-  await DB.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_visit_count ON mappings(visit_count)').run();
-  await DB.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_is_wechat ON mappings(isWechat)').run();
+  await database.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_expiry ON mappings(expiry)').run();
+  await database.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_created_at ON mappings(created_at)').run();
+  await database.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_updated_at ON mappings(updated_at)').run();
+  await database.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_enabled_expiry ON mappings(enabled, expiry)').run();
+  await database.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_visit_count ON mappings(visit_count)').run();
+  await database.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_is_wechat ON mappings(isWechat)').run();
 }
 
 async function getMappingByPath(path) {
@@ -710,6 +750,8 @@ async function getExpiringMappings() {
   return {
     expiring: expiring.items,
     expired: expired.items,
+    expiringTotal: expiring.pagination.totalItems,
+    expiredTotal: expired.pagination.totalItems,
   };
 }
 
@@ -722,15 +764,15 @@ async function getDashboard() {
   const stats = await DB.prepare(`
     SELECT
       COUNT(*) AS total,
-      SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS active_total,
+      SUM(CASE WHEN enabled = 1 AND (expiry IS NULL OR substr(expiry, 1, 10) > ?) THEN 1 ELSE 0 END) AS active_total,
       SUM(CASE WHEN enabled = 0 THEN 1 ELSE 0 END) AS disabled_total,
-      SUM(CASE WHEN expiry IS NOT NULL AND substr(expiry, 1, 10) < ? THEN 1 ELSE 0 END) AS expired_total,
+      SUM(CASE WHEN enabled = 1 AND expiry IS NOT NULL AND substr(expiry, 1, 10) < ? THEN 1 ELSE 0 END) AS expired_total,
       SUM(CASE WHEN enabled = 1 AND expiry IS NOT NULL AND substr(expiry, 1, 10) >= ? AND substr(expiry, 1, 10) <= ? THEN 1 ELSE 0 END) AS expiring_total,
       SUM(CASE WHEN isWechat = 1 THEN 1 ELSE 0 END) AS wechat_total,
       SUM(COALESCE(visit_count, 0)) AS visit_total
     FROM mappings
     WHERE path NOT IN (${reservedPlaceholders})
-  `).bind(today, today, expiringLimit, ...bindings).first();
+  `).bind(expiringLimit, today, today, expiringLimit, ...bindings).first();
 
   const topVisited = await DB.prepare(`
     SELECT path, target, name, expiry, enabled, isWechat, qrCodeData, announcementHtml, hintHtml, visit_count, last_visited_at, created_at, updated_at
@@ -801,12 +843,43 @@ async function cleanupExpiredMappings() {
 }
 
 async function trackVisit(path) {
-  await DB.prepare(`
-    UPDATE mappings
-    SET visit_count = COALESCE(visit_count, 0) + 1,
-        last_visited_at = ?
-    WHERE path = ?
-  `).bind(new Date().toISOString(), path).run();
+  try {
+    await DB.prepare(`
+      UPDATE mappings
+      SET visit_count = COALESCE(visit_count, 0) + 1,
+          last_visited_at = ?
+      WHERE path = ?
+    `).bind(new Date().toISOString(), path).run();
+  } catch (error) {
+    console.error(`Failed to track visit for path "${path}":`, error);
+  }
+}
+
+async function sendWebhookNotification(env, message) {
+  const webhookUrl = env.NOTIFICATION_WEBHOOK_URL;
+  if (!webhookUrl) {
+    return;
+  }
+  try {
+    const response = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        msgtype: 'text',
+        text: { content: message },
+        msg_type: 'text',
+        content: { text: message },
+      }),
+    });
+    if (!response.ok) throw new Error(`Webhook returned HTTP ${response.status}`);
+    const result = await response.json();
+    const code = result.errcode ?? result.code ?? result.StatusCode;
+    if (code !== undefined && Number(code) !== 0) {
+      throw new Error(`Webhook rejected notification (code: ${String(code).slice(0, 100)})`);
+    }
+  } catch (error) {
+    console.error('Failed to send webhook notification:', error);
+  }
 }
 
 async function readRequestJson(request) {
@@ -832,6 +905,38 @@ async function serveAsset(request, env, url, path) {
 
 function shouldServeAssetFirst(path) {
   return !path || path === 'admin' || path === 'login' || path.includes('.') || RESERVED_PATHS.has(path);
+}
+
+function createDisabledHtml(mapping) {
+  const title = escapeHtml(mapping.name ? `${mapping.name} 已暂停访问` : '链接已暂停访问');
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${title}</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; background: #f5f5f5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .card { width: min(100%, 360px); padding: 28px 24px; text-align: center; background: #fff; border-radius: 18px; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.08); }
+    h1 { margin: 0 0 12px; font-size: 22px; color: #111827; }
+    p { margin: 8px 0; color: #6b7280; line-height: 1.6; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #0f172a; }
+      .card { background: #111827; box-shadow: none; }
+      h1 { color: #f8fafc; }
+      p { color: #cbd5e1; }
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>${title}</h1>
+    <p>该链接已被管理员暂停使用。</p>
+    <p>如需继续访问，请联系管理员开启。</p>
+  </div>
+</body>
+</html>`;
 }
 
 function createExpiredHtml(mapping) {
@@ -918,7 +1023,12 @@ async function handleApi(request, env, ctx, url, path) {
     }
     try {
       const body = await readRequestJson(request);
-      if (String(body.password || '') !== String(env.PASSWORD || '')) {
+      const configuredPassword = env.PASSWORD;
+      if (!configuredPassword || typeof configuredPassword !== 'string' || !configuredPassword.trim()) {
+        throw new AppError('系统未配置管理员密码 (PASSWORD)，请先在 Cloudflare 环境变量中设置', 500, 'CONFIG_ERROR');
+      }
+      const inputPassword = String(body.password || '');
+      if (inputPassword !== configuredPassword.trim()) {
         throw new AppError('密码错误，请重试', 401, 'UNAUTHORIZED');
       }
       return json({ success: true }, 200, await setAuthCookie(env));
@@ -967,6 +1077,7 @@ async function handleApi(request, env, ctx, url, path) {
           'Content-Type': 'application/json;charset=UTF-8',
           'Content-Disposition': `attachment; filename="${filename}"`,
           'Cache-Control': 'no-store',
+          ...SECURITY_HEADERS,
         },
       });
     }
@@ -1022,13 +1133,24 @@ async function handleMappingRequest(path, env, ctx) {
   }
 
   if (!mapping.enabled) {
-    return new Response('Not Found', { status: 404 });
+    return new Response(createDisabledHtml(mapping), {
+      status: 403,
+      headers: {
+        'Content-Type': 'text/html;charset=UTF-8',
+        'Cache-Control': 'no-store',
+        ...SECURITY_HEADERS,
+      },
+    });
   }
 
   if (mapping.expiry && isExpiredDate(mapping.expiry)) {
     return new Response(createExpiredHtml(mapping), {
       status: 404,
-      headers: { 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' },
+      headers: {
+        'Content-Type': 'text/html;charset=UTF-8',
+        'Cache-Control': 'no-store',
+        ...SECURITY_HEADERS,
+      },
     });
   }
 
@@ -1036,7 +1158,11 @@ async function handleMappingRequest(path, env, ctx) {
 
   if (mapping.isWechat && mapping.qrCodeData) {
     return new Response(createWechatHtml(mapping), {
-      headers: { 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' },
+      headers: {
+        'Content-Type': 'text/html;charset=UTF-8',
+        'Cache-Control': 'no-store',
+        ...SECURITY_HEADERS,
+      },
     });
   }
 
@@ -1046,7 +1172,6 @@ async function handleMappingRequest(path, env, ctx) {
 export default {
   async fetch(request, env, ctx) {
     DB = env.DB;
-    await initDatabase();
 
     const url = new URL(request.url);
     const path = normalizePath(url.pathname);
@@ -1055,12 +1180,30 @@ export default {
       return Response.redirect(`${url.origin}/admin`, 302);
     }
 
-    if (path.startsWith('api/')) {
-      return handleApi(request, env, ctx, url, path);
+    if (path === 'admin') {
+      const isAuthenticated = await verifyAuthCookie(request, env);
+      if (!isAuthenticated) {
+        return Response.redirect(`${url.origin}/login`, 302);
+      }
+      return serveAsset(request, env, url, path);
+    }
+
+    if (path === 'login') {
+      const isAuthenticated = await verifyAuthCookie(request, env);
+      if (isAuthenticated) {
+        return Response.redirect(`${url.origin}/admin`, 302);
+      }
+      return serveAsset(request, env, url, path);
     }
 
     if (shouldServeAssetFirst(path)) {
       return serveAsset(request, env, url, path);
+    }
+
+    await ensureDatabase(DB);
+
+    if (path.startsWith('api/')) {
+      return handleApi(request, env, ctx, url, path);
     }
 
     const mappingResponse = await handleMappingRequest(path, env, ctx);
@@ -1073,13 +1216,30 @@ export default {
 
   async scheduled(controller, env) {
     DB = env.DB;
-    await initDatabase();
+    await ensureDatabase(DB);
     const expiring = await getExpiringMappings();
     const cleanedCount = await cleanupExpiredMappings();
     console.log(JSON.stringify({
-      expiringCount: expiring.expiring.length,
-      expiredCount: expiring.expired.length,
+      expiringCount: expiring.expiringTotal,
+      expiredCount: expiring.expiredTotal,
       cleanedCount,
     }));
+
+    if (env.NOTIFICATION_WEBHOOK_URL && (expiring.expiring.length > 0 || expiring.expired.length > 0)) {
+      const formatNames = (items, total, label) => {
+        const names = items.slice(0, 5).map((m) => `• ${String(m.name || m.path).slice(0, 20)} (${label}: ${m.expiry})`).join('\n');
+        return names + (total > 5 ? `\n（仅显示前 5 条，共 ${total} 条）` : '');
+      };
+      const expiringNames = formatNames(expiring.expiring, expiring.expiringTotal, '到期');
+      const expiredNames = formatNames(expiring.expired, expiring.expiredTotal, '已到期');
+      let msg = `【QRCode Hub 提醒】\n`;
+      if (expiring.expiring.length > 0) {
+        msg += `有 ${expiring.expiringTotal} 个二维码即将失效：\n${expiringNames}\n`;
+      }
+      if (expiring.expired.length > 0) {
+        msg += `有 ${expiring.expiredTotal} 个二维码已失效：\n${expiredNames}\n`;
+      }
+      await sendWebhookNotification(env, msg.trim());
+    }
   },
 };

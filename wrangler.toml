@@ -9,7 +9,7 @@ database_name = "qrcode_hub"
 database_id = "3cfe51cf-82f6-4e1d-8c2a-459a55645aae"
 
 [triggers]
-crons = ["0 2 */1 * *"]
+crons = ["0 2 * * *"]
 
 [[env.dev.d1_databases]]
 binding = "DB"
@@ -17,7 +17,7 @@ database_name = "qrcode_hub_dev"
 database_id = "1cfa1ef6-a076-410b-aa19-50f63411313c"
 
 [env.dev.triggers]
-crons = ["*/10 * * * * *"]
+crons = ["* * * * *"]
 
 [assets]
 directory = "./dist"
