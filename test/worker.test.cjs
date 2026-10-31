@@ -6,17 +6,26 @@ const vm = require('node:vm');
 const { DatabaseSync } = require('node:sqlite');
 const { webcrypto } = require('node:crypto');
 
-function loadWorker(fetchImpl = fetch) {
+function loadWorker(fetchImpl = fetch, DateImpl = Date) {
   const source = readFileSync(join(__dirname, '..', 'index.js'), 'utf8')
     .replace('export default {', 'globalThis.worker = {');
   const errors = [];
   const context = vm.createContext({
-    Response, Request, URL, TextEncoder, crypto: webcrypto, btoa,
+    Response, Request, URL, TextEncoder, crypto: webcrypto, btoa, Date: DateImpl,
     fetch: fetchImpl, console: { log() {}, error: (...args) => errors.push(args) },
   });
-  vm.runInContext(`${source}\nglobalThis.testApi = { handleApi, getDashboard, listMappings, getChinaDate, initDatabase, sendWebhookNotification, setDatabase: value => { DB = value; } };`, context);
+  vm.runInContext(`${source}\nglobalThis.testApi = { handleApi, getDashboard, listMappings, getMalaysiaDate, initDatabase, sendWebhookNotification, setDatabase: value => { DB = value; } };`, context);
   return { api: context.testApi, errors };
 }
+
+test('Malaysia date changes at midnight MYT', () => {
+  const dateAt = instant => class extends Date { static now() { return Date.parse(instant); } };
+  const before = loadWorker(fetch, dateAt('2026-01-01T15:59:59Z')).api;
+  const after = loadWorker(fetch, dateAt('2026-01-01T16:00:00Z')).api;
+  assert.equal(before.getMalaysiaDate(), '2026-01-01');
+  assert.equal(after.getMalaysiaDate(), '2026-01-02');
+  assert.equal(after.getMalaysiaDate(-1), '2026-01-01');
+});
 
 function memoryDatabase() {
   const db = new DatabaseSync(':memory:');
@@ -42,9 +51,9 @@ test('dashboard and list agree on mutually exclusive statuses', async () => {
     await api.initDatabase(db);
     const insert = db.prepare('INSERT INTO mappings (path, target, enabled, expiry) VALUES (?, ?, ?, ?)');
     for (const [path, enabled, expiry] of [
-      ['active', 1, null], ['future', 1, api.getChinaDate(4)],
-      ['today', 1, api.getChinaDate()], ['boundary', 1, api.getChinaDate(3)],
-      ['expired', 1, api.getChinaDate(-1)], ['disabled', 0, api.getChinaDate(-1)],
+      ['active', 1, null], ['future', 1, api.getMalaysiaDate(4)],
+      ['today', 1, api.getMalaysiaDate()], ['boundary', 1, api.getMalaysiaDate(3)],
+      ['expired', 1, api.getMalaysiaDate(-1)], ['disabled', 0, api.getMalaysiaDate(-1)],
     ]) await insert.bind(path, 'https://example.com', enabled, expiry).run();
     const dashboard = await api.getDashboard();
     assert.equal(dashboard.total, 6);

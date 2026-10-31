@@ -174,7 +174,8 @@ function clearAuthCookie() {
   };
 }
 
-function getChinaDate(dayOffset = 0) {
+function getMalaysiaDate(dayOffset = 0) {
+  // Malaysia Time (MYT) is UTC+08:00.
   const now = new Date(Date.now() + 8 * 60 * 60 * 1000);
   now.setUTCHours(0, 0, 0, 0);
   now.setUTCDate(now.getUTCDate() + dayOffset);
@@ -376,7 +377,7 @@ function isExpiredDate(expiry) {
   if (!expiry) {
     return false;
   }
-  return expiry.slice(0, 10) < getChinaDate();
+  return expiry.slice(0, 10) < getMalaysiaDate();
 }
 
 function isExpiringDate(expiry) {
@@ -384,8 +385,8 @@ function isExpiringDate(expiry) {
     return false;
   }
   const dateText = expiry.slice(0, 10);
-  const today = getChinaDate();
-  return dateText >= today && dateText <= getChinaDate(EXPIRING_DAYS);
+  const today = getMalaysiaDate();
+  return dateText >= today && dateText <= getMalaysiaDate(EXPIRING_DAYS);
 }
 
 function getMappingStatus(mapping) {
@@ -438,8 +439,8 @@ function parseListParams(searchParams) {
 function buildFilterQuery(filters) {
   const where = [`path NOT IN (${Array.from(RESERVED_PATHS).map(() => '?').join(',')})`];
   const bindings = Array.from(RESERVED_PATHS);
-  const today = getChinaDate();
-  const expiringLimit = getChinaDate(EXPIRING_DAYS);
+  const today = getMalaysiaDate();
+  const expiringLimit = getMalaysiaDate(EXPIRING_DAYS);
 
   if (filters.query) {
     const keyword = `%${filters.query}%`;
@@ -756,8 +757,8 @@ async function getExpiringMappings() {
 }
 
 async function getDashboard() {
-  const today = getChinaDate();
-  const expiringLimit = getChinaDate(EXPIRING_DAYS);
+  const today = getMalaysiaDate();
+  const expiringLimit = getMalaysiaDate(EXPIRING_DAYS);
   const bindings = Array.from(RESERVED_PATHS);
   const reservedPlaceholders = bindings.map(() => '?').join(',');
 
@@ -834,7 +835,7 @@ async function importMappings(items) {
 }
 
 async function cleanupExpiredMappings() {
-  const cutoff = getChinaDate(-EXPIRED_RETENTION_DAYS);
+  const cutoff = getMalaysiaDate(-EXPIRED_RETENTION_DAYS);
   const result = await DB.prepare(`
     DELETE FROM mappings
     WHERE expiry IS NOT NULL AND substr(expiry, 1, 10) < ?
@@ -1071,7 +1072,7 @@ async function handleApi(request, env, ctx, url, path) {
 
     if (path === 'api/mappings/export' && request.method === 'GET') {
       const exported = await exportMappings();
-      const filename = `mappings-${getChinaDate().replace(/-/g, '')}.json`;
+      const filename = `mappings-${getMalaysiaDate().replace(/-/g, '')}.json`;
       return new Response(JSON.stringify({ items: exported }, null, 2), {
         headers: {
           'Content-Type': 'application/json;charset=UTF-8',

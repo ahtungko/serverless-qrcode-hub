@@ -814,7 +814,7 @@
       if (Number.isNaN(date.getTime())) {
         return value;
       }
-      return date.toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' });
+      return date.toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Kuala_Lumpur' });
     }
 
     function getShortUrl(path) {
@@ -1558,7 +1558,7 @@
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = url;
-        link.download = `mappings-${new Date().toISOString().slice(0, 10)}.json`;
+        link.download = `mappings-${new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kuala_Lumpur', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())}.json`;
         document.body.appendChild(link);
         link.click();
         link.remove();
