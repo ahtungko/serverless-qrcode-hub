@@ -856,24 +856,71 @@ async function trackVisit(path) {
   }
 }
 
+async function sendTelegramNotification(env, message) {
+  const token = env.TELEGRAM_BOT_TOKEN;
+  const chatId = env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) {
+    return;
+  }
+  try {
+    const url = `https://api.telegram.org/bot${token}/sendMessage`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: message,
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(`Telegram returned HTTP ${response.status}`);
+    }
+    const result = await response.json();
+    if (result.ok === false) {
+      throw new Error(`Telegram error: ${result.description || result.error_code}`);
+    }
+  } catch (error) {
+    console.error('Failed to send Telegram notification:', error);
+  }
+}
+
 async function sendWebhookNotification(env, message) {
   const webhookUrl = env.NOTIFICATION_WEBHOOK_URL;
   if (!webhookUrl) {
     return;
   }
   try {
-    const response = await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    let body;
+    if (webhookUrl.includes('api.telegram.org')) {
+      const parsed = new URL(webhookUrl);
+      const chatId = parsed.searchParams.get('chat_id') || env.TELEGRAM_CHAT_ID;
+      if (!chatId) {
+        throw new Error('Telegram webhook missing chat_id parameter');
+      }
+      body = { chat_id: chatId, text: message };
+    } else if (webhookUrl.includes('discord.com')) {
+      body = { content: message };
+    } else {
+      body = {
         msgtype: 'text',
         text: { content: message },
         msg_type: 'text',
         content: { text: message },
-      }),
+      };
+    }
+
+    const response = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
     });
     if (!response.ok) throw new Error(`Webhook returned HTTP ${response.status}`);
+    if (response.status === 204) return;
+
     const result = await response.json();
+    if (result.ok === false) {
+      throw new Error(`Telegram error: ${result.description || result.error_code}`);
+    }
     const code = result.errcode ?? result.code ?? result.StatusCode;
     if (code !== undefined && Number(code) !== 0) {
       throw new Error(`Webhook rejected notification (code: ${String(code).slice(0, 100)})`);
@@ -896,10 +943,10 @@ async function serveAsset(request, env, url, path) {
     return new Response('Not Found', { status: 404 });
   }
   let targetUrl = new URL(request.url);
-  if (path === 'admin') {
-    targetUrl = new URL('/admin.html', url.origin);
-  } else if (path === 'login') {
-    targetUrl = new URL('/login.html', url.origin);
+  if (['admin', 'admin/', 'admin.html'].includes(path)) {
+    targetUrl = new URL('/admin', url.origin);
+  } else if (['login', 'login/', 'login.html'].includes(path)) {
+    targetUrl = new URL('/login', url.origin);
   }
   return env.ASSETS.fetch(new Request(targetUrl.toString(), request));
 }
@@ -1181,7 +1228,7 @@ export default {
       return Response.redirect(`${url.origin}/admin`, 302);
     }
 
-    if (path === 'admin') {
+    if (['admin', 'admin/', 'admin.html'].includes(path)) {
       const isAuthenticated = await verifyAuthCookie(request, env);
       if (!isAuthenticated) {
         return Response.redirect(`${url.origin}/login`, 302);
@@ -1189,7 +1236,7 @@ export default {
       return serveAsset(request, env, url, path);
     }
 
-    if (path === 'login') {
+    if (['login', 'login/', 'login.html'].includes(path)) {
       const isAuthenticated = await verifyAuthCookie(request, env);
       if (isAuthenticated) {
         return Response.redirect(`${url.origin}/admin`, 302);
@@ -1226,7 +1273,11 @@ export default {
       cleanedCount,
     }));
 
-    if (env.NOTIFICATION_WEBHOOK_URL && (expiring.expiring.length > 0 || expiring.expired.length > 0)) {
+    const hasNotification = Boolean(
+      env.NOTIFICATION_WEBHOOK_URL || (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID)
+    );
+
+    if (hasNotification && (expiring.expiring.length > 0 || expiring.expired.length > 0)) {
       const formatNames = (items, total, label) => {
         const names = items.slice(0, 5).map((m) => `• ${String(m.name || m.path).slice(0, 20)} (${label}: ${m.expiry})`).join('\n');
         return names + (total > 5 ? `\n（仅显示前 5 条，共 ${total} 条）` : '');
@@ -1240,7 +1291,13 @@ export default {
       if (expiring.expired.length > 0) {
         msg += `有 ${expiring.expiredTotal} 个二维码已失效：\n${expiredNames}\n`;
       }
-      await sendWebhookNotification(env, msg.trim());
+      const trimmedMsg = msg.trim();
+      if (env.NOTIFICATION_WEBHOOK_URL) {
+        await sendWebhookNotification(env, trimmedMsg);
+      }
+      if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && !env.NOTIFICATION_WEBHOOK_URL?.includes('api.telegram.org')) {
+        await sendTelegramNotification(env, trimmedMsg);
+      }
     }
   },
 };

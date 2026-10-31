@@ -14,8 +14,8 @@ function loadWorker(fetchImpl = fetch, DateImpl = Date) {
     Response, Request, URL, TextEncoder, crypto: webcrypto, btoa, Date: DateImpl,
     fetch: fetchImpl, console: { log() {}, error: (...args) => errors.push(args) },
   });
-  vm.runInContext(`${source}\nglobalThis.testApi = { handleApi, getDashboard, listMappings, getMalaysiaDate, initDatabase, sendWebhookNotification, setDatabase: value => { DB = value; } };`, context);
-  return { api: context.testApi, errors };
+  vm.runInContext(`${source}\nglobalThis.testApi = { handleApi, getDashboard, listMappings, getMalaysiaDate, initDatabase, sendWebhookNotification, sendTelegramNotification, setDatabase: value => { DB = value; } };`, context);
+  return { api: context.testApi, worker: context.worker, errors };
 }
 
 test('Malaysia date changes at midnight MYT', () => {
@@ -83,6 +83,30 @@ test('login rejects a missing password and issues an expiring session for a vali
   assert.equal(expired.status, 401);
 });
 
+test('admin routes authenticate before serving the page without accessing D1', async () => {
+  const { api, worker } = loadWorker();
+  const assetPaths = [];
+  const env = { PASSWORD: 'secret', ASSETS: { fetch: async request => {
+    assetPaths.push(new URL(request.url).pathname);
+    return new Response('admin page');
+  } } };
+  for (const path of ['/admin', '/admin/', '/admin.html']) {
+    const response = await worker.fetch(new Request(`https://example.com${path}`), env, {});
+    assert.equal(response.status, 302);
+    assert.equal(response.headers.get('location'), 'https://example.com/login');
+  }
+  assert.equal(assetPaths.length, 0);
+  const login = await api.handleApi(new Request('https://example.com/api/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'secret' }),
+  }), env, {}, new URL('https://example.com/api/login'), 'api/login');
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  for (const path of ['/admin', '/admin/', '/admin.html']) {
+    const response = await worker.fetch(new Request(`https://example.com${path}`, { headers: { Cookie: cookie } }), env, {});
+    assert.equal(response.status, 200);
+  }
+  assert.deepEqual(assetPaths, ['/admin', '/admin', '/admin']);
+});
+
 test('webhook failures are logged for HTTP and provider errors', async () => {
   let response = new Response('{"errcode":0}');
   const { api, errors } = loadWorker(async () => response);
@@ -94,4 +118,31 @@ test('webhook failures are logged for HTTP and provider errors', async () => {
   response = new Response('{"errcode":400}');
   await api.sendWebhookNotification(env, 'test');
   assert.equal(errors.length, 2);
+});
+
+test('Telegram notifications send with chat_id and log API errors', async () => {
+  let sentBody = null;
+  let sentUrl = null;
+  const mockFetch = async (url, init) => {
+    sentUrl = url;
+    sentBody = JSON.parse(init.body);
+    return new Response('{"ok":true}');
+  };
+  const { api, errors } = loadWorker(mockFetch);
+
+  // 1. Via TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+  await api.sendTelegramNotification({ TELEGRAM_BOT_TOKEN: 'token123', TELEGRAM_CHAT_ID: 'chat456' }, 'hello tg');
+  assert.equal(sentUrl, 'https://api.telegram.org/bottoken123/sendMessage');
+  assert.deepEqual(sentBody, { chat_id: 'chat456', text: 'hello tg' });
+  assert.equal(errors.length, 0);
+
+  // 2. Via NOTIFICATION_WEBHOOK_URL with query parameter chat_id
+  await api.sendWebhookNotification({ NOTIFICATION_WEBHOOK_URL: 'https://api.telegram.org/bottoken123/sendMessage?chat_id=chat789' }, 'hello tg url');
+  assert.deepEqual(sentBody, { chat_id: 'chat789', text: 'hello tg url' });
+
+  // 3. Telegram API error handling
+  const errorFetch = async () => new Response('{"ok":false,"error_code":400,"description":"Bad Request"}');
+  const errorWorker = loadWorker(errorFetch);
+  await errorWorker.api.sendTelegramNotification({ TELEGRAM_BOT_TOKEN: 'token', TELEGRAM_CHAT_ID: 'chat' }, 'fail');
+  assert.equal(errorWorker.errors.length, 1);
 });

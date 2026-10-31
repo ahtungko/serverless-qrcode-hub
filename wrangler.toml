@@ -22,3 +22,4 @@ crons = ["* * * * *"]
 [assets]
 directory = "./dist"
 binding = "ASSETS"
+run_worker_first = ["/admin", "/admin/", "/admin.html", "/login", "/login/", "/login.html"]
